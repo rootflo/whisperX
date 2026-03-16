@@ -1,7 +1,19 @@
 import os
 
-import pkg_resources
 from setuptools import find_packages, setup
+
+
+def load_requirements() -> list[str]:
+    req_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
+    requirements: list[str] = []
+    with open(req_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            requirements.append(line)
+    return requirements
+
 
 with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
@@ -18,13 +30,7 @@ setup(
     url="https://github.com/m-bain/whisperx",
     license="BSD-2-Clause",
     packages=find_packages(exclude=["tests*"]),
-    install_requires=[
-        str(r)
-        for r in pkg_resources.parse_requirements(
-            open(os.path.join(os.path.dirname(__file__), "requirements.txt"))
-        )
-    ]
-    + [f"pyannote.audio==3.3.2"],
+    install_requires=load_requirements() + ["pyannote.audio==3.3.2"],
     entry_points={
         "console_scripts": ["whisperx=whisperx.transcribe:cli"],
     },
