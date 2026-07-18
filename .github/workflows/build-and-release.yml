@@ -4,32 +4,39 @@ on:
   release:
     types: [published]
 
+permissions: {}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          python-version: "3.9"
+          persist-credentials: false
 
-      - name: Install dependencies
-        run: |
-          python -m pip install build
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.11.6"
+          python-version: "3.10"
+          enable-cache: false
 
-      - name: Build wheels
-        run: python -m build --wheel
+      - name: Check if lockfile is up to date
+        run: uv lock --check
+
+      - name: Build package
+        run: uv build
 
       - name: Release to Github
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+        run: gh release upload "$RELEASE_TAG" dist/*.whl
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
 
       - name: Publish package to PyPi
-        uses: pypa/gh-action-pypi-publish@27b31702a0e7fc50959f5ad993c78deac1bdfc29
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,6 +1,4 @@
-import hashlib
 import os
-import urllib
 from typing import Callable, Text, Union
 from typing import Optional
 
@@ -12,15 +10,15 @@ from pyannote.audio.pipelines import VoiceActivityDetection
 from pyannote.audio.pipelines.utils import PipelineModel
 from pyannote.core import Annotation, SlidingWindowFeature
 from pyannote.core import Segment
-from tqdm import tqdm
 
 from whisperx.diarize import Segment as SegmentX
 from whisperx.vads.vad import Vad
+from whisperx.log_utils import get_logger
 
-# deprecated
-VAD_SEGMENTATION_URL = "https://whisperx.s3.eu-west-2.amazonaws.com/model_weights/segmentation/0b5b3216d60a2d32fc086b47ea8c67589aaeb26b7e07fcbe620d6d0b83e209ea/pytorch_model.bin"
+logger = get_logger(__name__)
 
-def load_vad_model(device, vad_onset=0.500, vad_offset=0.363, use_auth_token=None, model_fp=None):
+
+def load_vad_model(device, vad_onset=0.500, vad_offset=0.363, token=None, model_fp=None):
     model_dir = torch.hub._get_torch_home()
 
     main_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,13 +38,7 @@ def load_vad_model(device, vad_onset=0.500, vad_offset=0.363, use_auth_token=Non
     if os.path.exists(model_fp) and not os.path.isfile(model_fp):
         raise RuntimeError(f"{model_fp} exists and is not a regular file")
 
-    model_bytes = open(model_fp, "rb").read()
-    if hashlib.sha256(model_bytes).hexdigest() != VAD_SEGMENTATION_URL.split('/')[-2]:
-        raise RuntimeError(
-            "Model has been downloaded but the SHA256 checksum does not match. Please retry loading the model."
-        )
-
-    vad_model = Model.from_pretrained(model_fp, use_auth_token=use_auth_token)
+    vad_model = Model.from_pretrained(model_fp, token=token)
     hyperparameters = {"onset": vad_onset,
                     "offset": vad_offset,
                     "min_duration_on": 0.1,
@@ -198,11 +190,11 @@ class VoiceActivitySegmentation(VoiceActivityDetection):
             self,
             segmentation: PipelineModel = "pyannote/segmentation",
             fscore: bool = False,
-            use_auth_token: Union[Text, None] = None,
+            token: Union[Text, None] = None,
             **inference_kwargs,
     ):
 
-        super().__init__(segmentation=segmentation, fscore=fscore, use_auth_token=use_auth_token, **inference_kwargs)
+        super().__init__(segmentation=segmentation, fscore=fscore, token=token, **inference_kwargs)
 
     def apply(self, file: AudioFile, hook: Optional[Callable] = None) -> Annotation:
         """Apply voice activity detection
@@ -240,10 +232,10 @@ class VoiceActivitySegmentation(VoiceActivityDetection):
 
 class Pyannote(Vad):
 
-    def __init__(self, device, use_auth_token=None, model_fp=None, **kwargs):
-        print(">>Performing voice activity detection using Pyannote...")
+    def __init__(self, device, token=None, model_fp=None, **kwargs):
+        logger.info("Performing voice activity detection using Pyannote...")
         super().__init__(kwargs['vad_onset'])
-        self.vad_pipeline = load_vad_model(device, use_auth_token=use_auth_token, model_fp=model_fp)
+        self.vad_pipeline = load_vad_model(device, token=token, model_fp=model_fp)
 
     def __call__(self, audio: AudioFile, **kwargs):
         return self.vad_pipeline(audio)
@@ -266,7 +258,7 @@ class Pyannote(Vad):
             segments_list.append(SegmentX(speech_turn.start, speech_turn.end, "UNKNOWN"))
 
         if len(segments_list) == 0:
-            print("No active speech found in audio")
+            logger.warning("No active speech found in audio")
             return []
         assert segments_list, "segments_list is empty."
         return Vad.merge_chunks(segments_list, chunk_size, onset, offset)

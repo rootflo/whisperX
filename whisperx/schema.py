@@ -1,4 +1,11 @@
-from typing import TypedDict, Optional, List, Tuple
+from typing import Callable, TypedDict, Optional, List, Tuple
+
+ProgressCallback = Optional[Callable[[float], None]]
+
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
 
 
 class SingleWordSegment(TypedDict):
@@ -28,6 +35,7 @@ class SingleSegment(TypedDict):
     start: float
     end: float
     text: str
+    avg_logprob: NotRequired[float]
 
 
 class SegmentData(TypedDict):
@@ -49,6 +57,7 @@ class SingleAlignedSegment(TypedDict):
     start: float
     end: float
     text: str
+    avg_logprob: NotRequired[float]
     words: List[SingleWordSegment]
     chars: Optional[List[SingleCharSegment]]
 

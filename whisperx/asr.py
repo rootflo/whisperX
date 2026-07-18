@@ -11,9 +11,13 @@ from faster_whisper.transcribe import TranscriptionOptions, get_ctranslate2_stor
 from transformers import Pipeline
 from transformers.pipelines.pt_utils import PipelineIterator
 
-from .audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
-from .types import SingleSegment, TranscriptionResult
-from .vads import Vad, Silero, Pyannote
+from whisperx.audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
+from whisperx.schema import SingleSegment, TranscriptionResult, ProgressCallback
+from whisperx.vads import Vad, Silero, Pyannote
+from whisperx.log_utils import get_logger
+
+logger = get_logger(__name__)
+
 
 def find_numeral_symbol_tokens(tokenizer):
     numeral_symbol_tokens = []
@@ -50,14 +54,11 @@ class WhisperModel(faster_whisper.WhisperModel):
             previous_tokens,
             without_timestamps=options.without_timestamps,
             prefix=options.prefix,
+            hotwords=options.hotwords
         )
 
         encoder_output = self.encode(features)
-
-        max_initial_timestamp_index = int(
-            round(options.max_initial_timestamp / self.time_precision)
-        )
-
+        
         result = self.model.generate(
                 encoder_output,
                 [prompt] * batch_size,
@@ -67,11 +68,20 @@ class WhisperModel(faster_whisper.WhisperModel):
                 max_length=self.max_length,
                 suppress_blank=options.suppress_blank,
                 suppress_tokens=options.suppress_tokens,
+                no_repeat_ngram_size=options.no_repeat_ngram_size,
+                repetition_penalty=options.repetition_penalty,
+                return_scores=True,
             )
 
         tokens_batch = [x.sequences_ids[0] for x in result]
 
-        def decode_batch(tokens: List[List[int]]) -> str:
+        avg_logprobs = []
+        for res in result:
+            seq_len = len(res.sequences_ids[0])
+            cum_logprob = res.scores[0] * (seq_len ** options.length_penalty)
+            avg_logprobs.append(cum_logprob / (seq_len + 1))
+
+        def decode_batch(tokens: List[List[int]]) -> List[str]:
             res = []
             for tk in tokens:
                 res.append([token for token in tk if token < tokenizer.eot])
@@ -80,7 +90,7 @@ class WhisperModel(faster_whisper.WhisperModel):
 
         text = decode_batch(tokens_batch)
 
-        return text
+        return {'text': text, 'avg_logprob': avg_logprobs}
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
@@ -158,7 +168,7 @@ class FasterWhisperPipeline(Pipeline):
 
     def _forward(self, model_inputs):
         outputs = self.model.generate_segment_batched(model_inputs['inputs'], self.tokenizer, self.options)
-        return {'text': outputs}
+        return outputs
 
     def postprocess(self, model_outputs):
         return model_outputs
@@ -195,6 +205,7 @@ class FasterWhisperPipeline(Pipeline):
         print_progress=False,
         combined_progress=False,
         verbose=False,
+        progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
         if isinstance(audio, str):
             audio = load_audio(audio)
@@ -245,7 +256,7 @@ class FasterWhisperPipeline(Pipeline):
         if self.suppress_numerals:
             previous_suppress_tokens = self.options.suppress_tokens
             numeral_symbol_tokens = find_numeral_symbol_tokens(self.tokenizer)
-            print(f"Suppressing numeral and symbol tokens")
+            logger.info("Suppressing numeral and symbol tokens")
             new_suppressed_tokens = numeral_symbol_tokens + self.options.suppress_tokens
             new_suppressed_tokens = list(set(new_suppressed_tokens))
             self.options = replace(self.options, suppress_tokens=new_suppressed_tokens)
@@ -258,16 +269,21 @@ class FasterWhisperPipeline(Pipeline):
                 base_progress = ((idx + 1) / total_segments) * 100
                 percent_complete = base_progress / 2 if combined_progress else base_progress
                 print(f"Progress: {percent_complete:.2f}%...")
+            if progress_callback is not None:
+                progress_callback(((idx + 1) / total_segments) * 100)
             text = out['text']
+            avg_logprob = out['avg_logprob']
             if batch_size in [0, 1, None]:
                 text = text[0]
+                avg_logprob = avg_logprob[0]
             if verbose:
                 print(f"Transcript: [{round(vad_segments[idx]['start'], 3)} --> {round(vad_segments[idx]['end'], 3)}] {text}")
             segments.append(
                 {
                     "text": text,
                     "start": round(vad_segments[idx]['start'], 3),
-                    "end": round(vad_segments[idx]['end'], 3)
+                    "end": round(vad_segments[idx]['end'], 3),
+                    "avg_logprob": avg_logprob,
                 }
             )
 
@@ -283,7 +299,7 @@ class FasterWhisperPipeline(Pipeline):
 
     def detect_language(self, audio: np.ndarray) -> str:
         if audio.shape[0] < N_SAMPLES:
-            print("Warning: audio is shorter than 30s, language detection may be inaccurate.")
+            logger.warning("Audio is shorter than 30s, language detection may be inaccurate")
         model_n_mels = self.model.feat_kwargs.get("feature_size")
         segment = log_mel_spectrogram(audio[: N_SAMPLES],
                                       n_mels=model_n_mels if model_n_mels is not None else 80,
@@ -292,7 +308,7 @@ class FasterWhisperPipeline(Pipeline):
         results = self.model.model.detect_language(encoder_output)
         language_token, language_probability = results[0][0]
         language = language_token[2:-2]
-        print(f"Detected language: {language} ({language_probability:.2f}) in first 30s of audio...")
+        logger.info(f"Detected language: {language} ({language_probability:.2f}) in first 30s of audio")
         return language
 
 
@@ -300,7 +316,7 @@ def load_model(
     whisper_arch: str,
     device: str,
     device_index=0,
-    compute_type="float16",
+    compute_type="default",
     asr_options: Optional[dict] = None,
     language: Optional[str] = None,
     vad_model: Optional[Vad]= None,
@@ -311,13 +327,16 @@ def load_model(
     download_root: Optional[str] = None,
     local_files_only=False,
     threads=4,
+    use_auth_token: Optional[Union[str, bool]] = None,
 ) -> FasterWhisperPipeline:
     """Load a Whisper model for inference.
     Args:
         whisper_arch - The name of the Whisper model to load.
         device - The device to load the model on.
         compute_type - The compute type to use for the model.
-        vad_method - The vad method to use. vad_model has higher priority if is not None.
+            Use "default" to automatically select based on device (float16 for GPU, float32 for CPU).
+        vad_model - The vad model to manually assign.
+        vad_method - The vad method to use. vad_model has a higher priority if it is not None.
         options - A dictionary of options to use for the model.
         language - The language of the model. (use English for now)
         model - The WhisperModel instance to use.
@@ -328,6 +347,10 @@ def load_model(
         A Whisper pipeline.
     """
 
+    if compute_type == "default":
+        compute_type = "float16" if device == "cuda" else "float32"
+        logger.info(f"Compute type not specified, defaulting to {compute_type} for device {device}")
+
     if whisper_arch.endswith(".en"):
         language = "en"
 
@@ -337,11 +360,12 @@ def load_model(
                          compute_type=compute_type,
                          download_root=download_root,
                          local_files_only=local_files_only,
-                         cpu_threads=threads)
+                         cpu_threads=threads,
+                         use_auth_token=use_auth_token)
     if language is not None:
         tokenizer = Tokenizer(model.hf_tokenizer, model.model.is_multilingual, task=task, language=language)
     else:
-        print("No language specified, language will be first be detected for each audio file (increases inference time).")
+        logger.info("No language specified, language will be detected for each audio file (increases inference time)")
         tokenizer = None
 
     default_asr_options =  {
@@ -399,7 +423,11 @@ def load_model(
         if vad_method == "silero":
             vad_model = Silero(**default_vad_options)
         elif vad_method == "pyannote":
-            vad_model = Pyannote(torch.device(device), use_auth_token=None, **default_vad_options)
+            if device == 'cuda':
+                device_vad = f'cuda:{device_index}'
+            else:
+                device_vad = device
+            vad_model = Pyannote(torch.device(device_vad), token=None, **default_vad_options)
         else:
             raise ValueError(f"Invalid vad_method: {vad_method}")
 
